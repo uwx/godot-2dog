@@ -24,6 +24,23 @@ def get_opts():
             ["windows", "linux", "external"],
             ignorecase=2,
         ),
+        # external: the SDL tree is not in thirdparty/sdl3-full. Both must be absolute or
+        # relative to the engine root; a platform-specific fork supplies its own build config.
+        (
+            "sdl3_external_root",
+            "SDL3 fork to build instead of thirdparty/sdl3-full (sdl3_host=external)",
+            "",
+        ),
+        (
+            "sdl3_external_sources",
+            "Newline- or space-separated SDL sources, relative to sdl3_external_root (sdl3_host=external)",
+            "",
+        ),
+        BoolVariable(
+            "sdl3_external_build_config",
+            "Use sdl3_external_root's include/build_config instead of the in-tree one",
+            True,
+        ),
         BoolVariable("use_llvm", "Use the LLVM compiler", False),
         BoolVariable("use_mingw", "Use MinGW-w64 even if MSVC is installed.", False),
         ("mingw_prefix", "MinGW-w64 install prefix (empty: tools are on PATH)", os.getenv("MINGW_PREFIX", "")),
@@ -87,7 +104,20 @@ def configure(env: "SConsEnvironment"):
     env["sdl"] = True
     env["sdl3"] = True
 
-    if not os.path.isdir("thirdparty/sdl3-full/include"):
+    if env["sdl3_host"] == "external":
+        # A fork shipped outside this repository: it replaces the in-tree tree entirely, so the engine build
+        # needs only its root and source list. Nothing here may name that fork.
+        root = env["sdl3_external_root"]
+        if not root or not os.path.isdir(os.path.join(root, "include")):
+            print_error(
+                "sdl3_host=external needs sdl3_external_root pointing at an SDL tree with an include/ directory "
+                "(pass it as an absolute path or relative to the engine root)."
+            )
+            sys.exit(255)
+        if not env["sdl3_external_sources"].strip():
+            print_error("sdl3_host=external needs sdl3_external_sources: the fork's SDL sources, relative to its root.")
+            sys.exit(255)
+    elif not os.path.isdir("thirdparty/sdl3-full/include"):
         print_error("thirdparty/sdl3-full is missing. Run: git submodule update --init --recursive")
         sys.exit(255)
 
@@ -96,7 +126,15 @@ def configure(env: "SConsEnvironment"):
     # platform gets this from its own build setup; here it must be global.
     env.AppendUnique(CPPDEFINES=["WIN32_LEAN_AND_MEAN", "_CRT_SECURE_NO_WARNINGS"])
 
-    env.Prepend(CPPPATH=["#thirdparty/sdl3-full/include", "#thirdparty/sdl3-full/include/build_config", "#platform/sdl3"])
+    if env["sdl3_host"] == "external":
+        # The fork's headers first: its include/build_config defines the platform's backends. A fork without one
+        # keeps the in-tree public headers for the shared SDL API.
+        env.Prepend(CPPPATH=["#platform/sdl3"])
+        if env["sdl3_external_build_config"]:
+            env.Prepend(CPPPATH=[os.path.join(env["sdl3_external_root"], "include", "build_config")])
+        env.Prepend(CPPPATH=[os.path.join(env["sdl3_external_root"], "include")])
+    else:
+        env.Prepend(CPPPATH=["#thirdparty/sdl3-full/include", "#thirdparty/sdl3-full/include/build_config", "#platform/sdl3"])
     # SDL_MAIN_HANDLED: the engine owns main(); SDL_main.h would redefine it.
     env.Append(CPPDEFINES=["SDL3_ENABLED", "SDL_ENABLED", "SDL_MAIN_HANDLED"])
 

@@ -10,8 +10,8 @@ from SCons.Errors import UserError
 
 # Full SDL3, built as part of the engine for 2dog's `sdl3` platform.
 # The reduced copy in thirdparty/sdl stays joypad-only for every other platform.
-# Console builds replace this directory's contents with the platform's SDL fork
-# and pass their own source list through env["sdl3_external_sources"].
+# A build that ships SDL outside this repository sets sdl3_host=external with
+# sdl3_external_root and sdl3_external_sources; nothing here names such a fork.
 #
 # Sources are globbed the same way SDL's own CMakeLists.txt globs them, so this
 # list does not rot every time SDL adds a file. The per-target groups below are
@@ -140,31 +140,49 @@ def build(env):
             sources = [sdl_dir + line.strip() for line in f if line.strip()]
         env_sdl.Append(CPPDEFINES=["SDL_MAIN_HANDLED", "USING_GENERATED_CONFIG_H", "_REENTRANT"])
         env_sdl.Append(CPPPATH=["/usr/include/dbus-1.0", "/usr/lib/x86_64-linux-gnu/dbus-1.0/include"])
-    elif env.get("sdl3_external_sources"):
-        sources = env["sdl3_external_sources"]
+    elif env.get("sdl3_host") == "external":
+        # Paths relative to the fork's root; SCons resolves them from the engine root, so make them absolute.
+        root = os.path.abspath(env["sdl3_external_root"])
+        entries = env.get("sdl3_external_sources", "").split()
+        if not entries:
+            raise UserError("sdl3_host=external needs sdl3_external_sources with at least one source file.")
+        sources = [os.path.join(root, os.path.normpath(entry)) for entry in entries]
+        env_sdl.Append(CPPDEFINES=["SDL_MAIN_HANDLED"])
     else:
         raise UserError(
             "thirdparty/sdl3-full has no source list for this target. "
-            "Set sdl3_host=windows or linux for desktop development, or point the build at a console SDL fork."
+            "Set sdl3_host=windows or linux for desktop development, or sdl3_host=external with "
+            "sdl3_external_root and sdl3_external_sources for a tree kept outside this repository."
         )
 
-    env_sdl.Prepend(
-        CPPPATH=[
-            sdl_dir + "include",
-            sdl_dir + "include/build_config",
-            sdl_dir + "src",
-            sdl_dir + "src/video",
-            sdl_dir + "src/video/khronos",
-            sdl_dir + "src/events",
-            sdl_dir + "src/joystick",
-        ]
-    )
+    if env.get("sdl3_host") == "external":
+        # SDL's own headers come from detect.py; these are the private ones its sources include directly.
+        root = os.path.abspath(env["sdl3_external_root"])
+        env_sdl.Prepend(
+            CPPPATH=[os.path.join(root, "src")] + [
+                os.path.join(root, "src", d) for d in ("video", "video/khronos", "events", "joystick", "core")
+            ]
+        )
+    else:
+        env_sdl.Prepend(
+            CPPPATH=[
+                sdl_dir + "include",
+                sdl_dir + "include/build_config",
+                sdl_dir + "src",
+                sdl_dir + "src/video",
+                sdl_dir + "src/video/khronos",
+                sdl_dir + "src/events",
+                sdl_dir + "src/joystick",
+            ]
+        )
 
     if env.get("sdl3_host") == "linux":
         # Must come before include/build_config, whose static SDL_build_config.h rejects generated builds.
         env_sdl.Prepend(CPPPATH=["#platform/sdl3/linux"])
 
     env_sdl.Append(CPPDEFINES=["SDL_BUILDING_LIBRARY"])
-    # Audio, camera and dialogs are not built; SDL.c's init calls are guarded by these.
-    env_sdl.Append(CPPDEFINES=["SDL_AUDIO_DISABLED", "SDL_CAMERA_DISABLED", "SDL_DIALOG_DISABLED"])
+    if env.get("sdl3_host") != "external":
+        # Audio, camera and dialogs are not built; SDL.c's init calls are guarded by these. An external tree
+        # builds its own platform backends, so it keeps whatever subsystems its build config enables.
+        env_sdl.Append(CPPDEFINES=["SDL_AUDIO_DISABLED", "SDL_CAMERA_DISABLED", "SDL_DIALOG_DISABLED"])
     return sources, env_sdl
