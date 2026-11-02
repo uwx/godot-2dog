@@ -31,6 +31,8 @@
 #include "os_sdl3.h"
 
 #include "core/config/project_settings.h"
+#include "core/io/dir_access.h"
+#include "core/profiling/profiling.h"
 
 #include "core/version_generated.gen.h"
 
@@ -39,6 +41,8 @@
 #include "core/variant/variant.h"
 #include "display_server_sdl3.h"
 #include "drivers/sdl/joypad_sdl.h"
+#include "main/main.h"
+#include "servers/display/display_server.h"
 
 #include <SDL3/SDL.h>
 
@@ -65,6 +69,9 @@
 #include <direct.h>
 #include <windows.h>
 #include <bcrypt.h>
+#else
+#include <limits.h>
+#include <unistd.h>
 #endif
 
 static String _as_string(const char *p_sdl_owned) {
@@ -119,9 +126,8 @@ void OS_SDL3::initialize() {
 #endif
 #endif
 
-	// main.cpp does not call this for libgodot hosts on every platform, and the
-	// joypad driver owns no timer of its own.
-	initialize_joypads();
+	// Joypads start in Main::setup, right after Input exists: the driver dispatches queued
+	// SDL_EVENT_JOYSTICK_ADDED through Input::get_singleton(), which is null before that.
 }
 
 void OS_SDL3::initialize_joypads() {
@@ -461,10 +467,51 @@ MainLoop *OS_SDL3::get_main_loop() const {
 	return main_loop;
 }
 
+void OS_SDL3::run() {
+	if (!main_loop) {
+		return;
+	}
+
+	main_loop->initialize();
+
+	while (true) {
+		GodotProfileFrameMark;
+		GodotProfileZone("OS_SDL3::run");
+		DisplayServer::get_singleton()->process_events(); // get rid of pending events
+		if (joypad_sdl) {
+			joypad_sdl->process_events();
+		}
+		if (Main::iteration()) {
+			break;
+		}
+	}
+
+	main_loop->finalize();
+}
+
 String OS_SDL3::get_executable_path() const {
-	// SDL owns this string for the life of the process; freeing it leaves SDL's
-	// internal cache dangling, so it must not go through _as_string().
+	// SDL_GetBasePath is the containing directory, and ProjectSettings appends `<name>.pck` to whatever this
+	// returns, so ask the OS for the executable file itself.
+#ifdef WINDOWS_ENABLED
+	WCHAR bufname[4096];
+	DWORD length = GetModuleFileNameW(nullptr, bufname, 4096);
+	if (length == 0 || length == 4096) {
+		return String();
+	}
+	return String::utf16((const char16_t *)bufname, length).replace_char('\\', '/');
+#elif defined(__linux__)
+	// Fixes running from a symlink.
+	char buf[PATH_MAX];
+	const ssize_t length = readlink("/proc/self/exe", buf, sizeof(buf));
+	if (length <= 0) {
+		return OS::get_executable_path();
+	}
+	return String::utf8(buf, length);
+#else
+	// Other targets have no portable file-path query; SDL's base path is the best available.
+	// shortcut: an embedded .pck next to such an executable is not auto-detected, pass --main-pack.
 	return String::utf8(SDL_GetBasePath());
+#endif
 }
 
 OS::DateTime OS_SDL3::get_datetime(bool utc) const {
@@ -492,9 +539,10 @@ OS::TimeZoneInfo OS_SDL3::get_time_zone_info() const {
 	if (SDL_GetCurrentTime(&now)) {
 		SDL_DateTime dt;
 		if (SDL_TimeToDateTime(now, &dt, true)) {
-			// SDL reports seconds east of UTC; Godot's bias is minutes where east
-			// is negative, matching Windows' TIME_ZONE_INFORMATION and OS_Unix.
-			info.bias = -dt.utc_offset / 60;
+			// SDL reports seconds east of UTC, and Godot's bias is minutes east-positive: OS_Windows negates
+			// TIME_ZONE_INFORMATION to get there, and OS_Unix maps strftime's %z the same way. Round, because
+			// SDL's Windows path truncates to milliseconds, so a whole-hour zone arrives as 3599 seconds.
+			info.bias = (int)Math::round(dt.utc_offset / 60.0);
 		}
 	}
 	// shortcut: SDL exposes no time zone name, so this stays empty, add a lookup
@@ -512,7 +560,9 @@ uint64_t OS_SDL3::get_ticks_usec() const {
 
 
 String OS_SDL3::get_user_data_dir(const String &p_user_dir) const {
-	return _sdl3_pref_path(get_godot_dir_name().path_join(p_user_dir));
+	// SDL_GetPrefPath creates only its own app folder, one level deep, and the name it gets is the whole
+	// relative path. Build the nested path under the data directory instead; ensure_user_data_dir() creates it.
+	return get_data_path().path_join(p_user_dir).replace_char('\\', '/');
 }
 
 String OS_SDL3::get_temp_path() const {

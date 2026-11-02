@@ -88,6 +88,9 @@ public:
 	virtual String get_version() const override;
 
 	virtual MainLoop *get_main_loop() const override;
+	// Drives the main loop for the in-process import/export helpers. OS has no virtual run(); every platform
+	// declares its own, as OS_LinuxBSD and OS_Windows do.
+	void run();
 	virtual String get_executable_path() const override;
 
 	virtual DateTime get_datetime(bool utc = false) const override;

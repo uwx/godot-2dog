@@ -44,6 +44,7 @@
 #include "drivers/gles3/rasterizer_gles3.h"
 #endif
 #include "os_sdl3.h"
+#include "servers/rendering/dummy/rasterizer_dummy.h"
 #include "servers/rendering/renderer_rd/renderer_compositor_rd.h"
 
 #include <SDL3/SDL.h>
@@ -80,6 +81,8 @@ Vector<String> DisplayServerSDL3::get_rendering_drivers_func() {
 #ifdef GLES3_ENABLED
 	drivers.push_back("opengl3");
 #endif
+	// RenderingServerDefault's own dummy renderer; without it in the list main.cpp rejects the driver.
+	drivers.push_back("dummy");
 	return drivers;
 }
 
@@ -104,6 +107,10 @@ DisplayServerSDL3::DisplayServerSDL3(const String &p_rendering_driver, DisplaySe
 
 	KeyMappingSDL3::initialize();
 
+	// Closing the last window posts SDL_EVENT_QUIT after SDL_EVENT_WINDOW_CLOSE_REQUESTED; both would dispatch
+	// WINDOW_EVENT_CLOSE_REQUEST and run a game's "save before quitting?" prompt twice.
+	SDL_SetHint(SDL_HINT_QUIT_ON_LAST_WINDOW_CLOSE, "0");
+
 	// The one SDL initialisation in the process. The joypad driver reuses it.
 	if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD)) {
 		ERR_PRINT(vformat("SDL_Init failed: %s", SDL_GetError()));
@@ -118,14 +125,23 @@ DisplayServerSDL3::DisplayServerSDL3(const String &p_rendering_driver, DisplaySe
 		size.y = 720;
 	}
 
+	// A driver that names no renderer here (dummy, or a driver this build lacks) must not construct a
+	// window that nothing can draw into: main.cpp only rejects drivers no display server lists.
+	const bool wants_vulkan = rendering_driver == "vulkan";
+	const bool wants_gl = rendering_driver == "opengl3";
+	if (!wants_vulkan && !wants_gl && rendering_driver != "dummy") {
+		ERR_PRINT(vformat("Rendering driver '%s' is not supported by the sdl3 display server.", rendering_driver));
+		return;
+	}
+
 	SDL_WindowFlags flags = SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #ifdef VULKAN_ENABLED
-	if (rendering_driver == "vulkan") {
+	if (wants_vulkan) {
 		flags |= SDL_WINDOW_VULKAN;
 	}
 #endif
 #ifdef GLES3_ENABLED
-	if (rendering_driver == "opengl3") {
+	if (wants_gl) {
 		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
 		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
 		SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
@@ -161,7 +177,7 @@ DisplayServerSDL3::DisplayServerSDL3(const String &p_rendering_driver, DisplaySe
 	window_position = Point2i(position);
 
 #ifdef VULKAN_ENABLED
-	if (rendering_driver == "vulkan") {
+	if (wants_vulkan) {
 		RenderingContextDriverVulkanSDL3 *vulkan_context = memnew(RenderingContextDriverVulkanSDL3);
 		rendering_context = vulkan_context;
 		if (vulkan_context->initialize() != OK) {
@@ -193,7 +209,7 @@ DisplayServerSDL3::DisplayServerSDL3(const String &p_rendering_driver, DisplaySe
 #endif
 
 #ifdef GLES3_ENABLED
-	if (rendering_driver == "opengl3") {
+	if (wants_gl) {
 		gl_context = SDL_GL_CreateContext(window);
 		if (gl_context == nullptr) {
 			ERR_PRINT(vformat("SDL_GL_CreateContext failed: %s", SDL_GetError()));
@@ -205,6 +221,11 @@ DisplayServerSDL3::DisplayServerSDL3(const String &p_rendering_driver, DisplaySe
 		_apply_vsync();
 	}
 #endif
+
+	if (rendering_driver == "dummy") {
+		// --rendering-driver dummy: the headless-style renderer over the real window.
+		RasterizerDummy::make_current();
+	}
 
 	if (!SDL_StartTextInput(window)) {
 		ERR_PRINT(vformat("SDL_StartTextInput failed: %s", SDL_GetError()));
@@ -270,7 +291,42 @@ bool DisplayServerSDL3::has_feature(DisplayServerEnums::Feature p_feature) const
 
 // Godot's keycode is the layout-aware key: the character itself (letters upper-cased) for anything printable,
 // the physical-key table for the rest. SDL keycodes are Unicode for printable keys and scancode | 1 << 30 otherwise.
+// Headless injection and nested menus leave the window unfocused, so ask SDL for the current state rather
+// than reading a field the event may not carry.
+static BitField<MouseButtonMask> _sdl3_button_mask() {
+	const SDL_MouseButtonFlags state = SDL_GetMouseState(nullptr, nullptr);
+	BitField<MouseButtonMask> mask;
+	if (state & SDL_BUTTON_LMASK) {
+		mask.set_flag(MouseButtonMask::LEFT);
+	}
+	if (state & SDL_BUTTON_MMASK) {
+		mask.set_flag(MouseButtonMask::MIDDLE);
+	}
+	if (state & SDL_BUTTON_RMASK) {
+		mask.set_flag(MouseButtonMask::RIGHT);
+	}
+	if (state & SDL_BUTTON_MASK(SDL_BUTTON_X1)) {
+		mask.set_flag(MouseButtonMask::MB_XBUTTON1);
+	}
+	if (state & SDL_BUTTON_MASK(SDL_BUTTON_X2)) {
+		mask.set_flag(MouseButtonMask::MB_XBUTTON2);
+	}
+	return mask;
+}
+
+static void _apply_sdl3_modifiers(const Ref<InputEventWithModifiers> &p_event, SDL_Keymod p_mod = SDL_KMOD_NONE) {
+	if (p_mod == SDL_KMOD_NONE) {
+		p_mod = SDL_GetModState();
+	}
+	p_event->set_shift_pressed(p_mod & (SDL_KMOD_LSHIFT | SDL_KMOD_RSHIFT));
+	p_event->set_ctrl_pressed(p_mod & (SDL_KMOD_LCTRL | SDL_KMOD_RCTRL));
+	p_event->set_alt_pressed(p_mod & (SDL_KMOD_LALT | SDL_KMOD_RALT));
+	p_event->set_meta_pressed(p_mod & (SDL_KMOD_LGUI | SDL_KMOD_RGUI));
+}
+
 static Key _keycode_from_event(const SDL_KeyboardEvent &p_event) {
+	// SDL builds this keycode with SDL_GetKeyFromScancode(scancode, modstate, true), and key_event=true clears
+	// the modifier state, so Shift+1 already arrives as '1' with Shift in its own field.
 	const SDL_Keycode sdl_key = p_event.key;
 	if (sdl_key >= 0x20 && sdl_key != 0x7F && sdl_key <= 0x10FFFF) {
 		const char32_t character = (sdl_key >= 'a' && sdl_key <= 'z') ? sdl_key - 32 : sdl_key;
@@ -290,10 +346,7 @@ static Ref<InputEventKey> _make_key_event(const SDL_KeyboardEvent &p_event, bool
 	key->set_location(KeyMappingSDL3::key_location(p_event.scancode));
 
 	// Modifiers are their own flags on the event; keycode stays the bare key (get_keycode_with_modifiers merges them).
-	key->set_shift_pressed(p_event.mod & (SDL_KMOD_LSHIFT | SDL_KMOD_RSHIFT));
-	key->set_ctrl_pressed(p_event.mod & (SDL_KMOD_LCTRL | SDL_KMOD_RCTRL));
-	key->set_alt_pressed(p_event.mod & (SDL_KMOD_LALT | SDL_KMOD_RALT));
-	key->set_meta_pressed(p_event.mod & (SDL_KMOD_LGUI | SDL_KMOD_RGUI));
+	_apply_sdl3_modifiers(key, p_event.mod);
 	return key;
 }
 
@@ -308,6 +361,8 @@ void DisplayServerSDL3::_handle_mouse_motion(const SDL_MouseMotionEvent &p_event
 	motion->set_position(Point2(p_event.x, p_event.y) * scale);
 	motion->set_global_position(Point2(p_event.x, p_event.y) * scale);
 	motion->set_relative(Point2(p_event.xrel, p_event.yrel) * scale);
+	_apply_sdl3_modifiers(motion);
+	motion->set_button_mask(_sdl3_button_mask());
 	Input::get_singleton()->parse_input_event(motion);
 }
 
@@ -322,6 +377,8 @@ void DisplayServerSDL3::_handle_mouse_button(const SDL_MouseButtonEvent &p_event
 	button->set_position(Point2(p_event.x, p_event.y) * scale);
 	button->set_global_position(Point2(p_event.x, p_event.y) * scale);
 	button->set_pressed(p_event.down);
+	_apply_sdl3_modifiers(button);
+	button->set_button_mask(_sdl3_button_mask());
 	switch (p_event.button) {
 		case SDL_BUTTON_LEFT:
 			button->set_button_index(MouseButton::LEFT);
@@ -373,6 +430,8 @@ void DisplayServerSDL3::_handle_mouse_wheel(const SDL_MouseWheelEvent &p_event) 
 		button->set_button_index(axis.index);
 		button->set_factor(axis.amount);
 		button->set_pressed(true);
+		_apply_sdl3_modifiers(button);
+		button->set_button_mask(_sdl3_button_mask());
 		Input::get_singleton()->parse_input_event(button);
 		// Parsing the same object twice in a frame is unsafe: the release is its own event.
 		button = button->duplicate();
@@ -470,6 +529,8 @@ void DisplayServerSDL3::process_events() {
 			SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_EVENT_GAMEPAD_STEAM_HANDLE_UPDATED + 1, SDL_EVENT_LAST) > 0) {
 		switch (event.type) {
 			case SDL_EVENT_QUIT:
+				// Not a close request: SDL posts it for a session end (logout, console quit), and the hint above
+				// already keeps last-window closes on SDL_EVENT_WINDOW_CLOSE_REQUESTED alone.
 				if (window_event_callback.is_valid()) {
 					window_event_callback.call(DisplayServerEnums::WINDOW_EVENT_CLOSE_REQUEST, DisplayServerEnums::MAIN_WINDOW_ID);
 				}
@@ -906,6 +967,9 @@ void DisplayServerSDL3::window_set_ime_position(const Point2i &p_pos, DisplaySer
 }
 
 void DisplayServerSDL3::window_set_mouse_passthrough(const Vector<Vector2> &p_region, DisplayServerEnums::WindowID p_window) {
+	// SDL has no click-through window API. A grab confines the cursor rather than letting clicks
+	// through, so it would be the opposite of what the call asks for.
+	// shortcut: passthrough is unimplemented, add it when a target exposes a hit-test region.
 }
 
 /* MOUSE */
